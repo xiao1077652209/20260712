@@ -1,48 +1,52 @@
-"""MSC preprocessing and a reproducible CARS-style wavelength selector."""
-
+"""MSC and Competitive Adaptive Reweighted Sampling (CARS)."""
 from __future__ import annotations
-
 import numpy as np
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.model_selection import KFold
 
 
-def msc(spectra: np.ndarray, reference: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
-    x = np.asarray(spectra, dtype=np.float64)
-    if x.ndim != 2:
-        raise ValueError("spectra must be a 2-D [samples, wavenumbers] array")
-    ref = x.mean(axis=0) if reference is None else np.asarray(reference)
+def msc(spectra, reference=None):
+    x = np.asarray(spectra, dtype=np.float64); ref = x.mean(0) if reference is None else np.asarray(reference)
     corrected = np.empty_like(x)
     for i, spectrum in enumerate(x):
-        slope, intercept = np.polyfit(ref, spectrum, 1)
-        corrected[i] = (spectrum - intercept) / slope
+        slope, intercept = np.polyfit(ref, spectrum, 1); corrected[i] = (spectrum-intercept)/slope
     return corrected, ref
 
 
-def cars_select(x: np.ndarray, y: np.ndarray, n_features: int = 114,
-                iterations: int = 50, components: int = 10, seed: int = 42) -> np.ndarray:
-    """Select variables by MC sampling, EDF elimination and PLS coefficients.
+def _rmsecv(x, y, indices, components, folds):
+    errors = []
+    for train, valid in folds.split(x):
+        ncomp = max(1, min(components, len(indices), len(train)-1))
+        pls = PLSRegression(n_components=ncomp).fit(x[train][:, indices], y[train])
+        errors.append(np.mean((pls.predict(x[valid][:, indices])-y[valid])**2))
+    return float(np.sqrt(np.mean(errors)))
 
-    The paper does not publish its selected indices; fitting on training data is required.
-    """
+
+def _variable_importance(pls, variable_count):
+    coef = np.asarray(pls.coef_)
+    variable_axis = 0 if coef.shape[0] == variable_count else 1
+    return np.linalg.norm(coef, axis=1-variable_axis)
+
+
+def cars_select(x, y, n_features=114, iterations=50, components=10, seed=42, return_history=False):
+    """CARS using MC calibration, EDF elimination, ARS sampling and RMSECV."""
     x, y = np.asarray(x), np.asarray(y)
-    rng = np.random.default_rng(seed)
-    active = np.arange(x.shape[1])
-    best, best_rmse = active.copy(), np.inf
-    folds = KFold(5, shuffle=True, random_state=seed)
+    if y.ndim == 1:
+        classes = np.unique(y); y = np.eye(len(classes))[np.searchsorted(classes, y)]
+    rng = np.random.default_rng(seed); active = np.arange(x.shape[1]); folds = KFold(5, shuffle=True, random_state=seed)
+    candidates = []; history = []
     for step in range(iterations):
-        sample = rng.choice(len(x), max(2, int(0.8 * len(x))), replace=False)
-        pls = PLSRegression(n_components=min(components, len(active), len(sample) - 1))
-        pls.fit(x[sample][:, active], y[sample])
-        importance = np.linalg.norm(np.atleast_2d(pls.coef_), axis=1)
-        target = max(n_features, int(x.shape[1] * (n_features / x.shape[1]) ** ((step + 1) / iterations)))
-        active = active[np.argsort(importance)[-min(target, len(active)):]]
-        errors = []
-        for train, valid in folds.split(x):
-            p = PLSRegression(n_components=min(components, len(active), len(train) - 1))
-            p.fit(x[train][:, active], y[train])
-            errors.append(np.mean((p.predict(x[valid][:, active]).ravel() - y[valid]) ** 2))
-        rmse = float(np.sqrt(np.mean(errors)))
-        if len(active) == n_features and rmse < best_rmse:
-            best, best_rmse = active.copy(), rmse
-    return np.sort(best if len(best) == n_features else active[:n_features])
+        sample = rng.choice(len(x), max(2, int(.8*len(x))), replace=False)
+        pls = PLSRegression(n_components=max(1, min(components, len(active), len(sample)-1))).fit(x[sample][:, active], y[sample])
+        weights = _variable_importance(pls, len(active)); weights = weights / max(weights.sum(), np.finfo(float).eps)
+        target = max(n_features, round(x.shape[1]*(n_features/x.shape[1])**((step+1)/iterations)))
+        chosen = rng.choice(len(active), size=min(target, len(active)), replace=False, p=weights)
+        active = active[chosen]
+        rmse = _rmsecv(x, y, active, components, folds); history.append((step+1, len(active), rmse)); candidates.append((rmse, active.copy()))
+    eligible = [item for item in candidates if len(item[1]) >= n_features]
+    _, best = min(eligible, key=lambda z: z[0])
+    if len(best) > n_features:
+        pls = PLSRegression(n_components=min(components, len(best))).fit(x[:, best], y)
+        importance = _variable_importance(pls, len(best)); best = best[np.argsort(importance)[-n_features:]]
+    result = np.sort(best)
+    return (result, history) if return_history else result

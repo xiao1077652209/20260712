@@ -3,5 +3,8 @@ __pycache__/
 *.py[cod]
 *.pt
 cars_indices.csv
+cars_history.csv
+results/
+results_*/
 .idea/
 .vscode/

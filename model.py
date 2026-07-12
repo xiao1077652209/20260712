@@ -1,87 +1,134 @@
-"""PyTorch reproduction of the JAC-SCM network described by Guan et al. (2026)."""
-
+"""Neural models used in the JAC-SCM paper experiments."""
 from __future__ import annotations
-
+import math
 import torch
 from torch import nn
 
 
 class SSCJAM(nn.Module):
-    """Spectral-Spatial-Channel Joint Attention Mechanism (Eqs. 9-14)."""
-
     def __init__(self, channels: int, reduction: int = 8, alpha: float = 0.7):
-        super().__init__()
-        hidden = max(channels // reduction, 1)
-        self.alpha = alpha
-        self.channel_mlp = nn.Sequential(
-            nn.Conv1d(channels, hidden, 1, bias=False), nn.ReLU(inplace=True),
-            nn.Conv1d(hidden, channels, 1, bias=False),
-        )
-        self.spatial = nn.Sequential(
-            nn.Conv1d(channels, hidden, 3, padding=1, bias=False),
-            nn.BatchNorm1d(hidden), nn.ReLU(inplace=True),
-            nn.Conv1d(hidden, 1, 3, padding=1), nn.Sigmoid(),
-        )
+        super().__init__(); hidden = max(channels // reduction, 1); self.alpha = alpha
+        self.channel_mlp = nn.Sequential(nn.Conv1d(channels, hidden, 1, bias=False), nn.ReLU(),
+                                         nn.Conv1d(hidden, channels, 1, bias=False))
+        self.spatial = nn.Sequential(nn.Conv1d(channels, hidden, 3, padding=1, bias=False),
+                                     nn.BatchNorm1d(hidden), nn.ReLU(),
+                                     nn.Conv1d(hidden, 1, 3, padding=1), nn.Sigmoid())
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        avg = torch.mean(x, dim=-1, keepdim=True)
-        maximum = torch.amax(x, dim=-1, keepdim=True)
-        channel_weight = torch.sigmoid(self.channel_mlp(avg) + self.channel_mlp(maximum))
-        spatial_weight = self.spatial(x)
-        return self.alpha * (x * channel_weight) + (1.0 - self.alpha) * (x * spatial_weight)
+    def forward(self, x):
+        avg, maximum = x.mean(-1, keepdim=True), x.amax(-1, keepdim=True)
+        channel = torch.sigmoid(self.channel_mlp(avg) + self.channel_mlp(maximum))
+        return self.alpha * x * channel + (1 - self.alpha) * x * self.spatial(x)
 
 
 class ConvBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int):
+    def __init__(self, cin, cout, kernel, regularized=False):
         super().__init__()
-        # padding="same" matches the boundary-padding statement in the paper.
-        self.layers = nn.Sequential(
-            nn.Conv1d(in_channels, out_channels, kernel_size, padding="same"),
-            nn.BatchNorm1d(out_channels), nn.ReLU(inplace=True), nn.MaxPool1d(2),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layers(x)
+        normalization = [nn.BatchNorm1d(cout)] if regularized else []
+        self.layers = nn.Sequential(nn.Conv1d(cin, cout, kernel, padding="same"), *normalization,
+                                    nn.ReLU(), nn.MaxPool1d(2))
+    def forward(self, x): return self.layers(x)
 
 
-class JACSCM(nn.Module):
-    """Improved LeNet-5 for 114-point NIR soybean spectra."""
-
-    def __init__(self, input_length: int = 114, num_classes: int = 10,
-                 attention_reduction: int = 8, attention_alpha: float = 0.7):
+class LeNet5Spectral(nn.Module):
+    """Paper ablations: attention=False/True produces LeNet-5/LeNet-5-SSC-JAM."""
+    def __init__(self, input_length=114, num_classes=10, attention=False):
         super().__init__()
-        self.conv = nn.Sequential(
-            ConvBlock(1, 32, 7),
-            SSCJAM(32, attention_reduction, attention_alpha),
-            ConvBlock(32, 64, 4),
-            ConvBlock(64, 128, 4),
-        )
-        with torch.no_grad():
-            flattened = self.conv(torch.zeros(1, 1, input_length)).numel()
-        self.fc = nn.Sequential(nn.Flatten(), nn.Linear(flattened, num_classes))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim == 2:
-            x = x.unsqueeze(1)
-        if x.ndim != 3 or x.shape[1] != 1:
-            raise ValueError("Expected spectra shaped [batch, length] or [batch, 1, length]")
-        return self.fc(self.conv(x))
+        layers = [ConvBlock(1, 32, 7)]
+        if attention: layers.append(SSCJAM(32))
+        layers += [ConvBlock(32, 64, 4), ConvBlock(64, 128, 4)]
+        self.conv = nn.Sequential(*layers)
+        with torch.no_grad(): width = self.conv(torch.zeros(1, 1, input_length)).numel()
+        self.fc = nn.Sequential(nn.Flatten(), nn.Linear(width, num_classes))
+    def forward(self, x): return self.fc(self.conv(x.unsqueeze(1) if x.ndim == 2 else x))
 
 
-def make_lawd_adamw(model: JACSCM, base_lr: float = 1e-3) -> torch.optim.AdamW:
-    """LAWD-AdamW parameter groups from Eq. 16 and Section 5.2."""
-    attention, convolution, fully_connected = [], [], []
-    for name, parameter in model.named_parameters():
-        if not parameter.requires_grad:
-            continue
-        if "conv.1" in name:
-            attention.append(parameter)
-        elif name.startswith("fc"):
-            fully_connected.append(parameter)
-        else:
-            convolution.append(parameter)
-    return torch.optim.AdamW([
-        {"params": attention, "lr": 1.2 * base_lr, "weight_decay": 1e-4},
-        {"params": convolution, "lr": base_lr, "weight_decay": 1e-4},
-        {"params": fully_connected, "lr": 0.9 * base_lr, "weight_decay": 5e-4},
-    ])
+class JACSCM(LeNet5Spectral):
+    """Tobacco-adapted JAC-SCM with a regularized, length-robust classifier."""
+    def __init__(self, input_length=114, num_classes=10, dropout=.3, **_):
+        nn.Module.__init__(self)
+        self.conv = nn.Sequential(ConvBlock(1, 32, 7, True), SSCJAM(32),
+                                  ConvBlock(32, 64, 4, True), ConvBlock(64, 128, 4, True))
+        with torch.no_grad(): width = self.conv(torch.zeros(1,1,input_length)).numel()
+        self.fc = nn.Sequential(nn.Flatten(), nn.Linear(width, 128), nn.ReLU(), nn.Dropout(dropout),
+                                nn.Linear(128, num_classes))
+
+    def forward(self, x):
+        features = self.conv(x.unsqueeze(1) if x.ndim == 2 else x)
+        return self.fc(features)
+
+
+class LSTMClassifier(nn.Module):
+    def __init__(self, input_length=114, num_classes=10, hidden=64):
+        super().__init__(); self.rnn = nn.LSTM(1, hidden, batch_first=True); self.fc = nn.Linear(hidden, num_classes)
+    def forward(self, x): return self.fc(self.rnn(x.unsqueeze(-1))[0][:, -1])
+
+
+class TemporalBlock(nn.Module):
+    def __init__(self, cin, cout, dilation):
+        super().__init__(); pad = dilation * 2
+        self.net = nn.Sequential(nn.Conv1d(cin, cout, 3, padding=pad, dilation=dilation), nn.ReLU(),
+                                 nn.Conv1d(cout, cout, 3, padding=pad, dilation=dilation), nn.ReLU())
+        self.skip = nn.Conv1d(cin, cout, 1) if cin != cout else nn.Identity(); self.pad = pad
+    def forward(self, x):
+        y = self.net(x)
+        if self.pad: y = y[..., :-2 * self.pad]
+        return torch.relu(y + self.skip(x))
+
+
+class TCNClassifier(nn.Module):
+    def __init__(self, input_length=114, num_classes=10):
+        super().__init__(); self.net = nn.Sequential(TemporalBlock(1, 32, 1), TemporalBlock(32, 64, 2))
+        self.fc = nn.Linear(64, num_classes)
+    def forward(self, x): return self.fc(self.net(x.unsqueeze(1)).mean(-1))
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__(); self.net = nn.Sequential(nn.Conv1d(channels, channels, 3, padding=1), nn.BatchNorm1d(channels),
+                                                     nn.ReLU(), nn.Conv1d(channels, channels, 3, padding=1), nn.BatchNorm1d(channels))
+    def forward(self, x): return torch.relu(x + self.net(x))
+
+
+class ResNetClassifier(nn.Module):
+    def __init__(self, input_length=114, num_classes=10):
+        super().__init__(); self.net = nn.Sequential(nn.Conv1d(1, 64, 7, padding=3), nn.ReLU(),
+                                                     ResidualBlock(64), ResidualBlock(64))
+        self.fc = nn.Linear(64, num_classes)
+    def forward(self, x): return self.fc(self.net(x.unsqueeze(1)).mean(-1))
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, dim, length=2048):
+        super().__init__(); pos = torch.arange(length).unsqueeze(1); scale = torch.exp(torch.arange(0, dim, 2) * (-math.log(10000) / dim))
+        pe = torch.zeros(length, dim); pe[:, 0::2] = torch.sin(pos * scale); pe[:, 1::2] = torch.cos(pos * scale); self.register_buffer("pe", pe)
+    def forward(self, x): return x + self.pe[:x.shape[1]]
+
+
+class TransformerClassifier(nn.Module):
+    def __init__(self, input_length=114, num_classes=10, dim=64):
+        super().__init__(); self.embed = nn.Linear(1, dim); self.pos = PositionalEncoding(dim)
+        self.encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(dim, 4, 128, batch_first=True), 2)
+        self.fc = nn.Linear(dim, num_classes)
+    def forward(self, x): return self.fc(self.encoder(self.pos(self.embed(x.unsqueeze(-1)))).mean(1))
+
+
+def build_neural_model(name, input_length=114, num_classes=10):
+    models = {"lenet5": lambda: LeNet5Spectral(input_length, num_classes),
+              "lenet5_ssc_jam": lambda: LeNet5Spectral(input_length, num_classes, True),
+              "lenet5_lawd": lambda: LeNet5Spectral(input_length, num_classes),
+              "jac_scm": lambda: JACSCM(input_length, num_classes), "lstm": lambda: LSTMClassifier(input_length, num_classes),
+              "tcn": lambda: TCNClassifier(input_length, num_classes), "resnet": lambda: ResNetClassifier(input_length, num_classes),
+              "transformer": lambda: TransformerClassifier(input_length, num_classes)}
+    if name not in models: raise ValueError(f"Unknown neural model: {name}")
+    return models[name]()
+
+
+def make_lawd_adamw(model, base_lr=1e-3):
+    attention, convolution, fc = [], [], []
+    for name, p in model.named_parameters():
+        (attention if "conv.1" in name and isinstance(model, JACSCM) else fc if name.startswith("fc") else convolution).append(p)
+    groups = []
+    if attention: groups.append({"params": attention, "lr": 1.2*base_lr, "weight_decay": 1e-4})
+    if convolution: groups.append({"params": convolution, "lr": base_lr, "weight_decay": 1e-4})
+    if fc: groups.append({"params": fc, "lr": .9*base_lr, "weight_decay": 5e-4})
+    return torch.optim.AdamW(groups)
